@@ -127,7 +127,7 @@
   (let 
     (
       (market-id (+ (var-get market-counter) u1))
-      (current-time block-height)
+      (current-time stacks-block-height)
       (prediction-end (+ current-time prediction-duration))
       (resolution-time (+ prediction-end resolution-delay))
     )
@@ -176,7 +176,7 @@
     )
     (asserts! (>= user-balance stake-amount) err-insufficient-balance)
     (asserts! (>= stake-amount min-stake-amount) err-invalid-params)
-    (asserts! (<= block-height (get prediction-end-time market)) err-prediction-period-ended)
+    (asserts! (<= stacks-block-height (get prediction-end-time market)) err-prediction-period-ended)
     (asserts! (not (get resolved market)) err-market-resolved)
     
     ;; Transfer stake to contract
@@ -228,7 +228,7 @@
       (market (unwrap! (map-get? markets { market-id: market-id }) err-not-found))
     )
     (asserts! (or (is-eq tx-sender contract-owner) (is-eq tx-sender (get creator market))) err-unauthorized)
-    (asserts! (>= block-height (get resolution-time market)) err-invalid-params)
+    (asserts! (>= stacks-block-height (get resolution-time market)) err-invalid-params)
     (asserts! (not (get resolved market)) err-market-resolved)
     
     (map-set markets
@@ -253,7 +253,7 @@
   (let 
     (
       (decision-id (+ (var-get decision-counter) u1))
-      (current-time block-height)
+      (current-time stacks-block-height)
       (voting-end (+ current-time voting-duration))
     )
     (asserts! (> voting-duration u0) err-invalid-params)
@@ -291,7 +291,7 @@
       (user-weight (calculate-voting-weight tx-sender (get category decision)))
       (existing-vote (map-get? decision-votes { decision-id: decision-id, user: tx-sender }))
     )
-    (asserts! (<= block-height (get voting-end-time decision)) err-market-closed)
+    (asserts! (<= stacks-block-height (get voting-end-time decision)) err-market-closed)
     (asserts! (not (get resolved decision)) err-market-resolved)
     (asserts! (is-none existing-vote) err-already-exists)
     
@@ -301,7 +301,7 @@
       {
         vote: vote,
         weight: user-weight,
-        timestamp: block-height
+        timestamp: stacks-block-height
       }
     )
     
@@ -381,10 +381,126 @@
       { user: user }
       {
         verified: true,
-        verification-time: block-height,
+        verification-time: stacks-block-height,
         reputation-score: u1000 ;; Starting reputation
       }
     )
     (ok true)
+  )
+)
+
+
+;; read only functions
+
+(define-read-only (get-market (market-id uint))
+  (map-get? markets { market-id: market-id })
+)
+
+(define-read-only (get-decision (decision-id uint))
+  (map-get? decisions { decision-id: decision-id })
+)
+
+(define-read-only (get-user-position (market-id uint) (user principal))
+  (map-get? market-positions { market-id: market-id, user: user })
+)
+
+(define-read-only (get-user-vote (decision-id uint) (user principal))
+  (map-get? decision-votes { decision-id: decision-id, user: user })
+)
+
+(define-read-only (get-user-prediction-score (user principal) (category (string-ascii 64)))
+  (map-get? user-prediction-scores { user: user, category: category })
+)
+
+(define-read-only (calculate-voting-weight (user principal) (category (string-ascii 64)))
+  (let 
+    (
+      (base-weight base-voting-weight)
+      (prediction-score (default-to 
+        { total-predictions: u0, correct-predictions: u0, total-stake: u0, profit: 0, accuracy-score: u0 }
+        (map-get? user-prediction-scores { user: user, category: category })
+      ))
+      (verification (map-get? user-verification { user: user }))
+      (accuracy-multiplier (if (> (get total-predictions prediction-score) u0)
+        (get accuracy-score prediction-score)
+        u100)) ;; Default 1.0x multiplier
+      (verification-bonus (if (and (is-some verification) (get verified (unwrap-panic verification)))
+        u50 ;; 0.5x bonus for verified users
+        u0))
+    )
+    (+ base-weight (/ (* base-weight (+ accuracy-multiplier verification-bonus)) u100))
+  )
+)
+
+(define-read-only (get-market-odds (market-id uint))
+  (let 
+    (
+      (market (unwrap! (map-get? markets { market-id: market-id }) err-not-found))
+      (total-stake (get total-stake market))
+      (outcome-a-stake (get outcome-a-stake market))
+      (outcome-b-stake (get outcome-b-stake market))
+    )
+    (if (> total-stake u0)
+      (ok {
+        outcome-a-probability: (/ (* outcome-a-stake u10000) total-stake),
+        outcome-b-probability: (/ (* outcome-b-stake u10000) total-stake),
+        total-stake: total-stake
+      })
+      (ok {
+        outcome-a-probability: u5000,
+        outcome-b-probability: u5000,
+        total-stake: u0
+      })
+    )
+  )
+)
+
+(define-read-only (get-decision-results (decision-id uint))
+  (let 
+    (
+      (decision (unwrap! (map-get? decisions { decision-id: decision-id }) err-not-found))
+      (total-votes (get total-weighted-votes decision))
+      (yes-votes (get yes-weighted-votes decision))
+      (no-votes (get no-weighted-votes decision))
+    )
+    (ok {
+      yes-percentage: (if (> total-votes u0) (/ (* yes-votes u10000) total-votes) u0),
+      no-percentage: (if (> total-votes u0) (/ (* no-votes u10000) total-votes) u0),
+      total-weighted-votes: total-votes,
+      resolved: (get resolved decision)
+    })
+  )
+)
+
+;; private functions
+
+(define-private (update-prediction-score 
+    (user principal) 
+    (category (string-ascii 64))
+    (market-id uint)
+    (was-correct bool))
+  (let 
+    (
+      (current-score (default-to 
+        { total-predictions: u0, correct-predictions: u0, total-stake: u0, profit: 0, accuracy-score: u0 }
+        (map-get? user-prediction-scores { user: user, category: category })
+      ))
+      (new-total (+ (get total-predictions current-score) u1))
+      (new-correct (if was-correct 
+        (+ (get correct-predictions current-score) u1)
+        (get correct-predictions current-score)))
+      (new-accuracy (if (> new-total u0)
+        (/ (* new-correct u10000) new-total)
+        u0))
+    )
+    (map-set user-prediction-scores
+      { user: user, category: category }
+      (merge current-score {
+        total-predictions: new-total,
+        correct-predictions: new-correct,
+        accuracy-score: new-accuracy
+      })
+    )
+    true
   )
 )
