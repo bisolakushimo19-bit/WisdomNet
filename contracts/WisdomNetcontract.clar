@@ -28,15 +28,23 @@
 (define-constant err-invalid-outcome (err u108))
 (define-constant err-decision-active (err u109))
 (define-constant err-prediction-period-ended (err u110))
+(define-constant err-contract-paused (err u111))
+(define-constant err-rate-limit-exceeded (err u112))
+(define-constant err-overflow (err u113))
+(define-constant err-invalid-input (err u114))
+(define-constant err-self-interaction (err u115))
 
 (define-constant max-prediction-weight u10000) ;; 100.00% with 2 decimal precision
 (define-constant min-stake-amount u1000000) ;; 1 STX minimum stake
 (define-constant base-voting-weight u100) ;; Base weight for new users
+(define-constant rate-limit-blocks u10) ;; Minimum blocks between operations
+(define-constant max-operations-per-block u5) ;; Maximum operations per user per block
 
 ;; data vars
 (define-data-var market-counter uint u0)
 (define-data-var decision-counter uint u0)
 (define-data-var platform-fee-rate uint u250) ;; 2.5% with 2 decimal precision
+(define-data-var contract-paused bool false)
 
 ;; data maps
 (define-map markets
@@ -114,7 +122,75 @@
   }
 )
 
+(define-map last-operation-block principal uint)
+(define-map operations-per-block {user: principal, block: uint} uint)
+
+;; Security helper functions
+(define-private (check-not-paused)
+  (if (var-get contract-paused)
+    err-contract-paused
+    (ok true)
+  )
+)
+
+(define-private (safe-add (a uint) (b uint))
+  (let ((result (+ a b)))
+    (asserts! (>= result a) err-overflow)
+    (ok result)
+  )
+)
+
+(define-private (safe-mul (a uint) (b uint))
+  (let ((result (* a b)))
+    (asserts! (or (is-eq b u0) (is-eq (/ result b) a)) err-overflow)
+    (ok result)
+  )
+)
+
+(define-private (check-rate-limit (user principal))
+  (let (
+    (current-block burn-block-height)
+    (last-block (default-to u0 (map-get? last-operation-block user)))
+    (ops-count (default-to u0 (map-get? operations-per-block {user: user, block: current-block})))
+  )
+    (asserts! 
+      (or 
+        (>= (- current-block last-block) rate-limit-blocks)
+        (< ops-count max-operations-per-block)
+      )
+      err-rate-limit-exceeded
+    )
+    (map-set last-operation-block user current-block)
+    (map-set operations-per-block {user: user, block: current-block} (+ ops-count u1))
+    (ok true)
+  )
+)
+
+(define-private (validate-string-not-empty-ascii (str (string-ascii 256)))
+  (if (> (len str) u0)
+    (ok true)
+    err-invalid-input
+  )
+)
+
 ;; public functions
+
+;; Pause/unpause contract (owner only)
+(define-public (pause-contract)
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (var-set contract-paused true)
+    (ok true)
+  )
+)
+
+(define-public (unpause-contract)
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (var-set contract-paused false)
+    (ok true)
+  )
+)
 
 ;; Market creation and management
 (define-public (create-prediction-market 
@@ -126,11 +202,15 @@
     (resolution-delay uint))
   (let 
     (
-      (market-id (+ (var-get market-counter) u1))
-      (current-time stacks-block-height)
-      (prediction-end (+ current-time prediction-duration))
-      (resolution-time (+ prediction-end resolution-delay))
+      (market-id (unwrap! (safe-add (var-get market-counter) u1) err-overflow))
+      (current-time burn-block-height)
+      (prediction-end (unwrap! (safe-add current-time prediction-duration) err-overflow))
+      (resolution-time (unwrap! (safe-add prediction-end resolution-delay) err-overflow))
     )
+    (try! (check-not-paused))
+    (try! (check-rate-limit tx-sender))
+    (try! (validate-string-not-empty-ascii title))
+    (try! (validate-string-not-empty-ascii category))
     (asserts! (> prediction-duration u0) err-invalid-params)
     (asserts! (> resolution-delay u0) err-invalid-params)
     (asserts! (< (len title) u257) err-invalid-params)
@@ -174,9 +254,12 @@
       ))
       (user-balance (stx-get-balance tx-sender))
     )
+    (try! (check-not-paused))
+    (try! (check-rate-limit tx-sender))
+    (asserts! (> stake-amount u0) err-invalid-params)
     (asserts! (>= user-balance stake-amount) err-insufficient-balance)
     (asserts! (>= stake-amount min-stake-amount) err-invalid-params)
-    (asserts! (<= stacks-block-height (get prediction-end-time market)) err-prediction-period-ended)
+    (asserts! (<= burn-block-height (get prediction-end-time market)) err-prediction-period-ended)
     (asserts! (not (get resolved market)) err-market-resolved)
     
     ;; Transfer stake to contract
@@ -187,15 +270,15 @@
       (map-set markets
         { market-id: market-id }
         (merge market {
-          total-stake: (+ (get total-stake market) stake-amount),
-          outcome-a-stake: (+ (get outcome-a-stake market) stake-amount)
+          total-stake: (unwrap! (safe-add (get total-stake market) stake-amount) err-overflow),
+          outcome-a-stake: (unwrap! (safe-add (get outcome-a-stake market) stake-amount) err-overflow)
         })
       )
       (map-set markets
         { market-id: market-id }
         (merge market {
-          total-stake: (+ (get total-stake market) stake-amount),
-          outcome-b-stake: (+ (get outcome-b-stake market) stake-amount)
+          total-stake: (unwrap! (safe-add (get total-stake market) stake-amount) err-overflow),
+          outcome-b-stake: (unwrap! (safe-add (get outcome-b-stake market) stake-amount) err-overflow)
         })
       )
     )
@@ -205,13 +288,13 @@
       (map-set market-positions
         { market-id: market-id, user: tx-sender }
         (merge current-position {
-          outcome-a-stake: (+ (get outcome-a-stake current-position) stake-amount)
+          outcome-a-stake: (unwrap! (safe-add (get outcome-a-stake current-position) stake-amount) err-overflow)
         })
       )
       (map-set market-positions
         { market-id: market-id, user: tx-sender }
         (merge current-position {
-          outcome-b-stake: (+ (get outcome-b-stake current-position) stake-amount)
+          outcome-b-stake: (unwrap! (safe-add (get outcome-b-stake current-position) stake-amount) err-overflow)
         })
       )
     )
@@ -227,8 +310,9 @@
     (
       (market (unwrap! (map-get? markets { market-id: market-id }) err-not-found))
     )
+    (try! (check-not-paused))
     (asserts! (or (is-eq tx-sender contract-owner) (is-eq tx-sender (get creator market))) err-unauthorized)
-    (asserts! (>= stacks-block-height (get resolution-time market)) err-invalid-params)
+    (asserts! (>= burn-block-height (get resolution-time market)) err-invalid-params)
     (asserts! (not (get resolved market)) err-market-resolved)
     
     (map-set markets
@@ -252,10 +336,14 @@
     (linked-markets (list 10 uint)))
   (let 
     (
-      (decision-id (+ (var-get decision-counter) u1))
-      (current-time stacks-block-height)
-      (voting-end (+ current-time voting-duration))
+      (decision-id (unwrap! (safe-add (var-get decision-counter) u1) err-overflow))
+      (current-time burn-block-height)
+      (voting-end (unwrap! (safe-add current-time voting-duration) err-overflow))
     )
+    (try! (check-not-paused))
+    (try! (check-rate-limit tx-sender))
+    (try! (validate-string-not-empty-ascii title))
+    (try! (validate-string-not-empty-ascii category))
     (asserts! (> voting-duration u0) err-invalid-params)
     (asserts! (< (len title) u257) err-invalid-params)
     (asserts! (< (len description) u1025) err-invalid-params)
@@ -291,7 +379,10 @@
       (user-weight (calculate-voting-weight tx-sender (get category decision)))
       (existing-vote (map-get? decision-votes { decision-id: decision-id, user: tx-sender }))
     )
-    (asserts! (<= stacks-block-height (get voting-end-time decision)) err-market-closed)
+    (try! (check-not-paused))
+    (try! (check-rate-limit tx-sender))
+    (asserts! (not (is-eq tx-sender (get creator decision))) err-self-interaction)
+    (asserts! (<= burn-block-height (get voting-end-time decision)) err-market-closed)
     (asserts! (not (get resolved decision)) err-market-resolved)
     (asserts! (is-none existing-vote) err-already-exists)
     
@@ -301,7 +392,7 @@
       {
         vote: vote,
         weight: user-weight,
-        timestamp: stacks-block-height
+        timestamp: burn-block-height
       }
     )
     
@@ -310,15 +401,15 @@
       (map-set decisions
         { decision-id: decision-id }
         (merge decision {
-          total-weighted-votes: (+ (get total-weighted-votes decision) user-weight),
-          yes-weighted-votes: (+ (get yes-weighted-votes decision) user-weight)
+          total-weighted-votes: (unwrap! (safe-add (get total-weighted-votes decision) user-weight) err-overflow),
+          yes-weighted-votes: (unwrap! (safe-add (get yes-weighted-votes decision) user-weight) err-overflow)
         })
       )
       (map-set decisions
         { decision-id: decision-id }
         (merge decision {
-          total-weighted-votes: (+ (get total-weighted-votes decision) user-weight),
-          no-weighted-votes: (+ (get no-weighted-votes decision) user-weight)
+          total-weighted-votes: (unwrap! (safe-add (get total-weighted-votes decision) user-weight) err-overflow),
+          no-weighted-votes: (unwrap! (safe-add (get no-weighted-votes decision) user-weight) err-overflow)
         })
       )
     )
@@ -335,6 +426,7 @@
       (position (unwrap! (map-get? market-positions { market-id: market-id, user: tx-sender }) err-not-found))
       (winning-outcome (unwrap! (get winning-outcome market) err-market-closed))
     )
+    (try! (check-not-paused))
     (asserts! (get resolved market) err-market-closed)
     (asserts! (not (get claimed position)) err-already-exists)
     
@@ -349,16 +441,18 @@
         (total-losing-stake (if winning-outcome 
           (get outcome-b-stake market) 
           (get outcome-a-stake market)))
-        (platform-fee (/ (* total-losing-stake (var-get platform-fee-rate)) u10000))
-        (winnings-pool (- total-losing-stake platform-fee))
+        (platform-fee (unwrap! (safe-mul total-losing-stake (var-get platform-fee-rate)) err-overflow))
+        (platform-fee-final (/ platform-fee u10000))
+        (winnings-pool (- total-losing-stake platform-fee-final))
+        (user-share-calc (unwrap! (safe-mul winnings-pool user-winning-stake) err-overflow))
         (user-share (if (> total-winning-stake u0)
-          (/ (* winnings-pool user-winning-stake) total-winning-stake)
+          (/ user-share-calc total-winning-stake)
           u0))
-        (total-payout (+ user-winning-stake user-share))
+        (total-payout (unwrap! (safe-add user-winning-stake user-share) err-overflow))
       )
       (asserts! (> user-winning-stake u0) err-unauthorized)
       
-      ;; Mark as claimed
+      ;; Mark as claimed BEFORE transfer (reentrancy protection)
       (map-set market-positions
         { market-id: market-id, user: tx-sender }
         (merge position { claimed: true })
@@ -376,12 +470,13 @@
 ;; User verification
 (define-public (verify-user (user principal))
   (begin
+    (try! (check-not-paused))
     (asserts! (is-eq tx-sender contract-owner) err-owner-only)
     (map-set user-verification
       { user: user }
       {
         verified: true,
-        verification-time: stacks-block-height,
+        verification-time: burn-block-height,
         reputation-score: u1000 ;; Starting reputation
       }
     )
@@ -472,6 +567,29 @@
   )
 )
 
+;; Security read-only functions
+(define-read-only (is-contract-paused)
+  (var-get contract-paused)
+)
+
+(define-read-only (get-last-operation-block (user principal))
+  (default-to u0 (map-get? last-operation-block user))
+)
+
+(define-read-only (get-market-creator (market-id uint))
+  (match (map-get? markets { market-id: market-id })
+    market (some (get creator market))
+    none
+  )
+)
+
+(define-read-only (get-decision-creator (decision-id uint))
+  (match (map-get? decisions { decision-id: decision-id })
+    decision (some (get creator decision))
+    none
+  )
+)
+
 ;; private functions
 
 (define-private (update-prediction-score 
@@ -489,8 +607,9 @@
       (new-correct (if was-correct 
         (+ (get correct-predictions current-score) u1)
         (get correct-predictions current-score)))
+      (new-accuracy-calc (* new-correct u10000))
       (new-accuracy (if (> new-total u0)
-        (/ (* new-correct u10000) new-total)
+        (/ new-accuracy-calc new-total)
         u0))
     )
     (map-set user-prediction-scores
