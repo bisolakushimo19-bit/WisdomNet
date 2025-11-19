@@ -36,15 +36,23 @@
 
 (define-constant max-prediction-weight u10000) ;; 100.00% with 2 decimal precision
 (define-constant min-stake-amount u1000000) ;; 1 STX minimum stake
+(define-constant max-stake-amount u100000000000) ;; 100,000 STX maximum stake per prediction
 (define-constant base-voting-weight u100) ;; Base weight for new users
 (define-constant rate-limit-blocks u10) ;; Minimum blocks between operations
 (define-constant max-operations-per-block u5) ;; Maximum operations per user per block
+(define-constant min-resolution-delay u144) ;; Minimum 1 day (144 blocks) before resolution
+(define-constant min-prediction-duration u144) ;; Minimum 1 day for predictions
+(define-constant max-prediction-duration u4320) ;; Maximum 30 days for predictions
+(define-constant min-participants u3) ;; Minimum participants before resolution
 
 ;; data vars
 (define-data-var market-counter uint u0)
 (define-data-var decision-counter uint u0)
 (define-data-var platform-fee-rate uint u250) ;; 2.5% with 2 decimal precision
+(define-data-var max-platform-fee-rate uint u1000) ;; 10% maximum fee cap
 (define-data-var contract-paused bool false)
+(define-data-var emergency-shutdown bool false)
+(define-data-var total-platform-fees uint u0)
 
 ;; data maps
 (define-map markets
@@ -63,7 +71,9 @@
     outcome-b-stake: uint,
     resolved: bool,
     winning-outcome: (optional bool), ;; true for A, false for B
-    linked-decision: (optional uint)
+    linked-decision: (optional uint),
+    participant-count: uint,
+    resolution-locked-until: uint
   }
 )
 
@@ -127,8 +137,9 @@
 
 ;; Security helper functions
 (define-private (check-not-paused)
-  (if (var-get contract-paused)
-    err-contract-paused
+  (begin
+    (asserts! (not (var-get emergency-shutdown)) err-contract-paused)
+    (asserts! (not (var-get contract-paused)) err-contract-paused)
     (ok true)
   )
 )
@@ -173,6 +184,22 @@
   )
 )
 
+(define-private (validate-time-bounds (duration uint))
+  (begin
+    (asserts! (>= duration min-prediction-duration) err-invalid-params)
+    (asserts! (<= duration max-prediction-duration) err-invalid-params)
+    (ok true)
+  )
+)
+
+(define-private (validate-stake-amount (amount uint))
+  (begin
+    (asserts! (>= amount min-stake-amount) err-invalid-params)
+    (asserts! (<= amount max-stake-amount) err-invalid-params)
+    (ok true)
+  )
+)
+
 ;; public functions
 
 ;; Pause/unpause contract (owner only)
@@ -187,8 +214,36 @@
 (define-public (unpause-contract)
   (begin
     (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (not (var-get emergency-shutdown)) err-contract-paused)
     (var-set contract-paused false)
     (ok true)
+  )
+)
+
+(define-public (emergency-shutdown-contract)
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (var-set emergency-shutdown true)
+    (var-set contract-paused true)
+    (ok true)
+  )
+)
+
+(define-public (set-platform-fee (new-fee uint))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (<= new-fee (var-get max-platform-fee-rate)) err-invalid-params)
+    (var-set platform-fee-rate new-fee)
+    (ok true)
+  )
+)
+
+(define-public (withdraw-platform-fees (amount uint))
+  (let ((total-fees (var-get total-platform-fees)))
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (<= amount total-fees) err-insufficient-balance)
+    (var-set total-platform-fees (- total-fees amount))
+    (as-contract (stx-transfer? amount tx-sender contract-owner))
   )
 )
 
@@ -211,8 +266,8 @@
     (try! (check-rate-limit tx-sender))
     (try! (validate-string-not-empty-ascii title))
     (try! (validate-string-not-empty-ascii category))
-    (asserts! (> prediction-duration u0) err-invalid-params)
-    (asserts! (> resolution-delay u0) err-invalid-params)
+    (try! (validate-time-bounds prediction-duration))
+    (asserts! (>= resolution-delay min-resolution-delay) err-invalid-params)
     (asserts! (< (len title) u257) err-invalid-params)
     (asserts! (< (len description) u1025) err-invalid-params)
     
@@ -232,7 +287,9 @@
         outcome-b-stake: u0,
         resolved: false,
         winning-outcome: none,
-        linked-decision: none
+        linked-decision: none,
+        participant-count: u0,
+        resolution-locked-until: resolution-time
       }
     )
     
@@ -256,30 +313,34 @@
     )
     (try! (check-not-paused))
     (try! (check-rate-limit tx-sender))
-    (asserts! (> stake-amount u0) err-invalid-params)
+    (try! (validate-stake-amount stake-amount))
     (asserts! (>= user-balance stake-amount) err-insufficient-balance)
-    (asserts! (>= stake-amount min-stake-amount) err-invalid-params)
     (asserts! (<= burn-block-height (get prediction-end-time market)) err-prediction-period-ended)
     (asserts! (not (get resolved market)) err-market-resolved)
+    (asserts! (not (is-eq tx-sender (get creator market))) err-self-interaction)
     
     ;; Transfer stake to contract
     (try! (stx-transfer? stake-amount tx-sender (as-contract tx-sender)))
     
-    ;; Update market totals
-    (if outcome
-      (map-set markets
-        { market-id: market-id }
-        (merge market {
-          total-stake: (unwrap! (safe-add (get total-stake market) stake-amount) err-overflow),
-          outcome-a-stake: (unwrap! (safe-add (get outcome-a-stake market) stake-amount) err-overflow)
-        })
-      )
-      (map-set markets
-        { market-id: market-id }
-        (merge market {
-          total-stake: (unwrap! (safe-add (get total-stake market) stake-amount) err-overflow),
-          outcome-b-stake: (unwrap! (safe-add (get outcome-b-stake market) stake-amount) err-overflow)
-        })
+    ;; Update market totals and participant count if first prediction
+    (let ((is-new-participant (is-none (map-get? market-positions { market-id: market-id, user: tx-sender }))))
+      (if outcome
+        (map-set markets
+          { market-id: market-id }
+          (merge market {
+            total-stake: (unwrap! (safe-add (get total-stake market) stake-amount) err-overflow),
+            outcome-a-stake: (unwrap! (safe-add (get outcome-a-stake market) stake-amount) err-overflow),
+            participant-count: (if is-new-participant (+ (get participant-count market) u1) (get participant-count market))
+          })
+        )
+        (map-set markets
+          { market-id: market-id }
+          (merge market {
+            total-stake: (unwrap! (safe-add (get total-stake market) stake-amount) err-overflow),
+            outcome-b-stake: (unwrap! (safe-add (get outcome-b-stake market) stake-amount) err-overflow),
+            participant-count: (if is-new-participant (+ (get participant-count market) u1) (get participant-count market))
+          })
+        )
       )
     )
     
@@ -312,8 +373,9 @@
     )
     (try! (check-not-paused))
     (asserts! (or (is-eq tx-sender contract-owner) (is-eq tx-sender (get creator market))) err-unauthorized)
-    (asserts! (>= burn-block-height (get resolution-time market)) err-invalid-params)
+    (asserts! (>= burn-block-height (get resolution-locked-until market)) err-invalid-params)
     (asserts! (not (get resolved market)) err-market-resolved)
+    (asserts! (>= (get participant-count market) min-participants) err-invalid-params)
     
     (map-set markets
       { market-id: market-id }
@@ -444,6 +506,7 @@
         (platform-fee (unwrap! (safe-mul total-losing-stake (var-get platform-fee-rate)) err-overflow))
         (platform-fee-final (/ platform-fee u10000))
         (winnings-pool (- total-losing-stake platform-fee-final))
+        (current-fees (var-get total-platform-fees))
         (user-share-calc (unwrap! (safe-mul winnings-pool user-winning-stake) err-overflow))
         (user-share (if (> total-winning-stake u0)
           (/ user-share-calc total-winning-stake)
@@ -461,8 +524,12 @@
       ;; Update user prediction scores
       (update-prediction-score tx-sender (get category market) market-id true)
       
+      ;; Update platform fees
+      (var-set total-platform-fees (unwrap! (safe-add current-fees platform-fee-final) err-overflow))
+      
       ;; Transfer winnings
-      (as-contract (stx-transfer? total-payout tx-sender tx-sender))
+      (try! (as-contract (stx-transfer? total-payout tx-sender contract-caller)))
+      (ok true)
     )
   )
 )
